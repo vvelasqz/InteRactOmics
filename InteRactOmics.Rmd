@@ -1,0 +1,411 @@
+---
+title: "InteractOmics"
+output: word_document
+author: "Valeria Velasquez"
+---
+
+## Reading and formating the datasets
+
+To start, download all the protein interactions for S cerevisiae from Biogrid using the bionetdata package. Additionally, load the transcriptomics and proteomics datasets from et al, which will be used as example for integration with the interactome network
+
+```{r}
+library(bionetdata)
+data(Yeast.Biogrid.data)
+protein_names <- colnames(Yeast.Biogrid.data)
+# Find the indices (row and column) where interactions occur (where the value is 1)
+interaction_indices <- which(Yeast.Biogrid.data == 1, arr.ind = TRUE)
+
+# Create a data frame from the interaction indices
+yeast_int <- data.frame(
+  INTERACTOR_A = protein_names[interaction_indices[, "row"]],
+  INTERACTOR_B = protein_names[interaction_indices[, "col"]]
+)
+
+transcriptomics<- read.csv(file="Transcriptomics.csv",header = TRUE, fill=TRUE, stringsAsFactors = F)
+proteomics<- read.csv(file="Proteomics.csv", header = TRUE, fill=TRUE, stringsAsFactors = F)
+
+```
+
+
+## Protein-protein interaction Network
+
+A first characterization of the interactome network was implemented by calculating several centrality metrics and evaluating some propeties like the power law distribution, which is important at the time of subsetting the network and for hypothesis testing
+
+```{r message=F}
+yeast_nodes <- data.frame(id= unique(c(yeast_int$INTERACTOR_A, yeast_int$INTERACTOR_B)))
+#subsample the matrix based on the degree of each node in the network
+calc_centrality <- function(interaction_table){
+  library(igraph)
+  if(is.data.frame(interaction_table)){
+      yeast_net <- graph_from_data_frame(interaction_table, directed = FALSE, vertices = NULL)
+  } else{
+    yeast_net <- interaction_table
+  }
+  centrality <- data.frame(node=as.character(vertex_attr(yeast_net, "name")), degree=degree(yeast_net), 
+                         rank_deg= rank(-degree(yeast_net)),
+                         betweenness=betweenness(yeast_net, directed = F), 
+                         rank_bet= rank(-betweenness(yeast_net, directed = F)), 
+                         hub_score= hub_score(yeast_net, scale = TRUE)$vector,
+                         rank_hub= rank(-hub_score(yeast_net, scale = TRUE)$vector), stringsAsFactors = F)
+  return(centrality)
+}
+
+#If we want to use te function, we call it on an interaction table ans it will return anoter table with 2 new cols, one for alpha and another for the eigen vector
+yeast_net_centr <- calc_centrality(yeast_int)
+
+library(igraph)
+yeast_net <- graph_from_data_frame(yeast_int, directed = FALSE, vertices = NULL)
+yeast_net<-igraph::simplify(yeast_net)
+plot(degree.distribution(yeast_net), type="b", log="xy")
+print("Fit a power law distribution for union")
+fit_power_law(degree(yeast_net), xmin = NULL, start = 2, force.continuous = FALSE,implementation = "plfit")
+
+clutering_coef <- data.frame(k=degree(yeast_net), coeff=transitivity(yeast_net, type = "localundirected"))
+
+library(tidyverse)
+ggplot(clutering_coef, aes(x=log(k), y=log(coeff)))+ geom_point()+ 
+  ggtitle("Clustering coefficient for the biogrid network")
+
+```
+
+Results from this analysis show that the yeast interactome has a power law distribution. The network and node properties can be also used to identify hubs and rank nodes based on their interconnectivity and essentiality
+
+
+## Integration between the yeast interactome with transcriptomics and proteomics data
+
+The yeast transcriptomics and proteomics datasets can be used to assign new attributes to the nodes and the edges from the interactome. Here we will explore an example using each of these strategies. The dataset consists of the expression counts for a series of metabolic mutants, including autothrophs for the amino acids: Leucine (L), Histidine (HL), double mutant (HL) and the wild-type.
+
+To assign attributes to the nodes, we will perform a differential expression analysis, followed by an epistasis classification as described by (), which can be used to subset the network and do some hypothesis testing.We will use DESeq2 to get differentially expressed genes. 
+
+The threshold values for differentially expressed mRNAs were adj. P < 0.05, fold change of >2 for upregulated genes and fold change of <0.5 for downregulated genes, and a read count of >50 in all yeast strains
+
+
+```{r}
+library(DESeq2)
+
+# Read, select, group and format count data
+countData=transcriptomics[,6:17]
+rownames(countData)<- transcriptomics$Unique_ID
+
+# Round count matrix
+counts=round(as.matrix(countData))
+
+# Selecting genes by counts
+#counts = subset(countData, rowSums(countData > 50) >= 12)
+print(nrow(counts))
+rm(countData)
+
+# Creating sample info
+gen=c("HL", "H", "L","WT")
+cols=data.frame(genotype=rep(gen, each=3), replication=rep(c(1,2,3),4))
+cols$replication = as.factor(cols$replication)
+rownames(cols) = colnames(counts)
+#rm(gen, time)
+
+############################################################################################
+# Creating DESeqDataSet and running DESeq for_de counts for each taxon https://support.bioconductor.org/p/66067/
+
+dds=DESeqDataSetFromMatrix(countData = counts, colData = cols, design = ~ genotype)
+dds=DESeq(dds)
+
+# Extracting and writing normalized counts
+temp = counts(dds, normalized=TRUE)
+norm_counts = data.frame(gene = rownames(temp), temp, row.names = NULL)
+
+#Now the contrasts between genotypes and timepoints https://support.bioconductor.org/p/67600/#67612
+resultsNames(dds)
+
+combi <-combn(c("H", "L","HL","WT"),2)
+padj_table <- data.frame(gene=norm_counts$gene)
+fc_table <- data.frame(gene=norm_counts$gene)
+FC_padj_table <- data.frame(gene=norm_counts$gene)
+
+counter<-0
+contrast_tables<- list()
+
+for(i in 1:ncol(combi)){
+    counter=counter+1
+    print(counter)
+    name<- paste0(combi[1,i], "_", combi[2,i])
+    contrast_tables[[name]]<-results(dds, contrast=c("genotype", combi[1,i], combi[2,i]))
+    padj_table<- cbind(padj_table, contrast_tables[[name]]$padj)
+    colnames(padj_table)[1+counter]<- paste0(name, "_padj")
+    fc_table<- cbind(fc_table, contrast_tables[[name]]$log2FoldChange)
+    colnames(fc_table)[1+counter]<- paste0(name, "_log2fc")
+    FC_padj_table<- cbind(FC_padj_table, contrast_tables[[name]][,c("log2FoldChange","padj")])
+    colnames(FC_padj_table)[(2*counter):(2*counter+1)]<- c(paste0(name, "_log2FoldChange"), 
+                                                           paste0(name, "_padj"))
+  }
+
+rld <- rlog(dds)
+
+plotPCA(rld, intgroup = "genotype")
+
+```
+
+Function to calculate epistatic genes based on differential expression is presented, which was used to calculate yeast epistasis. This analysis can be easily interchanged with a list of genes of interest, based on differential gene expression, experimental validation or any other source of information for that supports the biological question.
+
+
+```{r}
+get_epistatic<-function(triple_union_list, thr=1, thr_prop=0.2, mode="dev"){
+  result<- triple_union_list
+  result_notEpi<-list()
+  result[,grep("FoldChange", colnames(result))][is.na(result[,grep("FoldChange", colnames(result))])]<- 0
+    result$expected<-result[,4]+result[,6]
+    result$deviation<-result[,2]-result[,4]-result[,6]
+    result$dev_prop<-abs(result$deviation/(result[,2]+0.1))
+    if(mode=="dev"){
+      result_notEpi<- result[abs(result$deviation)<thr,]
+      result<- result[abs(result$deviation)>thr,]
+    }else{
+      result_notEpi<- result[result$dev_prop<thr_prop,]
+      result<- result[result$dev_prop>thr_prop,]
+    }
+  return(list(result,result_notEpi))
+}
+
+
+DE_wt<- FC_padj_table[, grep("gene|WT", colnames(FC_padj_table))][,c(1,6,7,2:5)]
+#change this so only er look at DE genes in wt dm comparisson
+epistatic_lists_prop<- get_epistatic(DE_wt, thr_prop = 0.4, mode = "prop")
+epistatic_prop<-epistatic_lists_prop[[1]]
+additive_prop<-epistatic_lists_prop[[2]]
+
+epistatic<-epistatic_lists_prop[[1]]
+additive<-epistatic_lists_prop[[2]]
+
+sum(yeast_nodes$id %in% epistatic$gene)
+
+# epistatic_lists<- get_epistatic(DE_wt, thr = 1)
+# epistatic<-epistatic_lists[[1]]
+# additive<-epistatic_lists[[2]]
+
+```
+
+## GO enrichment for the epi clusters
+
+```{r}
+## try http:// if https:// URLs are not supported
+#source("https://bioconductor.org/biocLite.R")
+## biocLite("BiocUpgrade") ## you may need this
+#biocLite("clusterProfiler")
+library(clusterProfiler)
+library(org.Sc.sgd.db)
+#for ppi clusters
+pdf("GO_epi_prot_clusters_igraph.pdf", width = 12, height = 15, fonts = "ArialMT", pointsize = 26)
+for (i in 1:5) {
+  print(dotplot(enrichGO(clusters_epi$names[clusters_epi$membership==i], 
+                         transcriptomics$Unique_ID, OrgDb = org.Sc.sgd.db, 
+                         ont= "BP",pAdjustMethod = "BH", 
+                         pvalueCutoff  = 0.05, qvalueCutoff  = 0.05,
+                         keyType = 'ENSEMBL'), 
+                showCategory=30, title=paste0("GO cluster number ", i)))
+}
+dev.off()
+
+```
+
+
+Now I will explore epistatic genes to check if these genes have any structure in the PPI, I will subset the network with these nodes and check components
+
+```{r}
+library(igraph)
+#components_yeast<- decompose(yeast_net, mode = "weak")
+#yeast_net <- components_yeast[[1]]
+
+sum(epistatic$gene %in% yeast_nodes$id)
+yeast_int_epistatic<- yeast_int[yeast_int$INTERACTOR_A %in% epistatic$gene | 
+                                  yeast_int$INTERACTOR_B %in% epistatic$gene, ]
+
+#add first neighbors
+# yeast_int_epistatic<- yeast_int[yeast_int$INTERACTOR_A %in% c(yeast_int_epistatic$INTERACTOR_A, yeast_int_epistatic$INTERACTOR_B) & yeast_int$INTERACTOR_B %in% c(yeast_int_epistatic$INTERACTOR_A, yeast_int_epistatic$INTERACTOR_B), ]
+
+yeast_net_epistatic <- graph_from_data_frame(yeast_int_epistatic, directed = FALSE)
+yeast_net_epistatic<- igraph::simplify(yeast_net_epistatic)
+is_simple(yeast_net_epistatic)
+
+yeast_epi_net_centr <- calc_centrality(yeast_net_epistatic)
+#yeast_epi_net_centr <- yeast_net_centr[yeast_net_centr$node %in% epistatic$gene,]
+
+random<- sample(yeast_nodes$id, sum(yeast_nodes$id %in% epistatic$gene), replace = F)
+yeast_net_centr_subset_random <- calc_centrality(induced_subgraph(yeast_net, random))
+
+degree<- data.frame(deg=c(yeast_net_centr$degree,
+                          yeast_epi_net_centr$degree, yeast_net_centr_subset_random$degree), 
+                    log_deg=c(log(yeast_net_centr$degree),
+                              log(yeast_epi_net_centr$degree),
+                              log(yeast_net_centr_subset_random$degree)), 
+                    type=c(rep("Total", nrow(yeast_net_centr)), 
+                               rep("Epistatic only", nrow(yeast_epi_net_centr)),
+                           rep("Random", nrow(yeast_net_centr_subset_random))))
+
+ggplot(degree, aes(x=log_deg, fill=type)) +  geom_density(alpha=0.5)+scale_fill_brewer(palette="Dark2")
+
+
+clusters_epi<- cluster_fast_greedy(yeast_net_epistatic)
+
+weights <- ifelse(igraph::crossing(clusters_epi, yeast_net_epistatic), 1, 100)
+#plot(clusters_epi, yeast_net_epistatic,vertex.label=NA)
+
+plot_clusters<- function(net, clusters){
+  G<- net
+  G_Grouped<- net
+  E(G_Grouped)$weight = 1
+  V(G)$Group1<- clusters$membership
+## Add edges with high weight between all nodes in the same group
+  for(i in unique(V(G)$Group1)) {
+    GroupV = which(V(G)$Group1 == i)
+    G_Grouped = add_edges(G_Grouped, combn(GroupV, 2), attr=list(weight=5))
+  } 
+
+## Now create a layout based on G_Grouped
+  LO = layout_with_fr(G_Grouped)
+  return(LO)
+}
+
+plot(clusters_epi, yeast_net_epistatic, vertex.size=5, layout=plot_clusters(yeast_net_epistatic, clusters_epi), vertex.label=NA, edge.color="gray")
+       
+```
+
+
+To filter the data based on proteomics and give weigth to the edges based on proteomics correlations, using that in the clustering algorithm form igraph
+
+```{r}
+#if I want to include the proteomics data to measure correlation 
+epistatic$gene_prot<- ifelse(epistatic$gene %in% proteomics$Unique_ID, epistatic$gene, NA)
+yeast_int_epistatic_prot<- yeast_int_epistatic[yeast_int_epistatic$INTERACTOR_A %in% proteomics$Unique_ID |
+                                                 yeast_int_epistatic$INTERACTOR_B %in% proteomics$Unique_ID, ]
+
+yeast_net_epistatic_prot <- graph_from_data_frame(yeast_int_epistatic_prot, directed = FALSE)
+
+yeast_epi_prot_net_centr <- calc_centrality(yeast_int_epistatic_prot)
+
+# Now I will calculate proteomics correlations to weight the edges
+a <- proteomics[proteomics$Unique_ID %in% yeast_epi_prot_net_centr$node, c(2,8:19)]
+rownames(a) <- a$Unique_ID
+a <- a[,-1]
+net_x <- as.data.frame(t(subset(a, rownames(a) %in% yeast_int_epistatic_prot$INTERACTOR_A)))
+net_y <- as.data.frame(t(subset(a, rownames(a) %in% yeast_int_epistatic_prot$INTERACTOR_B)))
+cor <- cor(x= net_x, y=net_y, method="spearman", use="pairwise")
+
+library(reshape2)
+cor_data <- melt(cor)
+colnames(cor_data) <- c("source", "target", "weight")
+cor_data <- merge(yeast_int_epistatic_prot, cor_data, by.x=c("INTERACTOR_A", "INTERACTOR_B"), by.y=c("source", "target"), all.x = TRUE)
+hist(cor_data$weight, breaks = 50)
+cor_data$weight<- (cor_data$weight - min(cor_data$weight))/
+                    (max(cor_data$weight)-min(cor_data$weight))+0.01
+#cor_data<- cor_data[!duplicated(cor_data)& cor_data$source!=cor_data$target,]
+weighted_yeast_net_epi <- graph_from_data_frame(cor_data, directed = FALSE, vertices = NULL)
+net <- igraph::simplify(weighted_yeast_net_epi)
+is_simple(net)
+# saveRDS(net, "net_DE_prot.RDS")
+# saveRDS(weighted_yeast_net_DE, "weighted_yeast_net_DE.RDS")
+
+```
+
+Hypothesis testing:
+
+Permutation analysis
+
+```{r}
+perm <- proteomics[proteomics$Unique_ID %in% yeast_epi_prot_net_centr$node, c(2,8:19)]
+
+permute <- function(table, m="spearman", interactome){  # or spearman, pearson
+  # here I am permuting the gene names in the table and according to the new order I will fill out the permuted table
+  b <- data.frame(Unique_ID=sample(table$Unique_ID, nrow(table), replace = FALSE, prob = NULL))
+  # I fill out the new table taking chunks of 3 because they are replicates (correlated data)
+  for(i in seq(2,12,3)){
+    # I merge the previous table (already permuted) with the original table to fill 
+    b <- merge(b, table[,c(1,i:(i+2))], by='Unique_ID', all.x = TRUE)
+    # I permute again the table to fill next timepoint 
+    b$Unique_ID <- sample(table$Unique_ID, nrow(table), replace = FALSE, prob = NULL)
+  }
+  #Now I build the matrix for the correlation calculations with the new permuted table b
+  rownames(b)<- b$Unique_ID
+  b$Unique_ID <- NULL
+  b_net_x <- as.data.frame(t(subset(b, rownames(b) %in% interactome$INTERACTOR_A)))
+  b_net_y <- as.data.frame(t(subset(b, rownames(b) %in% interactome$INTERACTOR_B)))
+  b_cor <- cor(x= b_net_x, y=b_net_y, method=m, use="pairwise")
+  cor_data_b <- melt(b_cor)
+  colnames(cor_data_b) <- c("INTERACTOR_A", "INTERACTOR_B", "correlation_score_b")
+  cor_data_b <- merge(interactome, cor_data_b, by=c("INTERACTOR_A", "INTERACTOR_B"), all.x = TRUE)
+  return(cor_data_b$correlation_score_b)
+}
+
+# I select the genotypes I want to permute the data for
+b_wt_s <- permute(perm, m="spearman", yeast_int_epistatic_prot)
+  #select the number of permutations
+  for (j in 1:10){
+    b_wt_s <- c(b_wt_s, permute(perm, m="spearman", yeast_int_epistatic_prot))
+  }
+
+p <- proteomics[, c(2,8:19)]
+rownames(p) <- p$Unique_ID
+p <- p[,-1]
+
+calculate_cor<- function(data, net, method="spearman"){
+  net_x <- as.data.frame(t(subset(data, rownames(data) %in% net$INTERACTOR_A)))
+  net_y <- as.data.frame(t(subset(data, rownames(data) %in% net$INTERACTOR_B)))
+  cor <- cor(x= net_x, y=net_y, method="spearman", use="pairwise")
+
+library(reshape2)
+cor_data <- melt(cor)
+colnames(cor_data) <- c("source", "target", "weight")
+cor_data <- merge(yeast_int_epistatic_prot, cor_data, by.x=c("INTERACTOR_A", "INTERACTOR_B"), by.y=c("source", "target"), all.x = TRUE)
+return(cor_data)
+  
+}
+
+cor_all_prot<- calculate_cor(p, yeast_int)
+
+permuted_df<- data.frame(perm=c(b_wt_s, melt(cor)$value, cor_all_prot$weight), 
+                         type=c(rep("Permuted", length(b_wt_s)),
+                                rep("Epistatic", nrow(melt(cor))), 
+                                rep("Proteome", nrow(cor_all_prot))))
+
+ggplot(permuted_df, aes(x=perm, fill=type)) +  geom_density(alpha=0.5)+scale_fill_brewer(palette="Dark2")
+
+```
+
+
+## PCA and PLS and mixomics to see integrate the metabolomics
+
+```{r}
+library(mixOmics)
+metabolomics<- read.csv(file="Metabolomics.csv",header = TRUE, fill=TRUE, stringsAsFactors = F)
+rownames(metabolomics)<- metabolomics$genotype
+metabolomics$genotype<- NULL
+metabolomics[is.na(metabolomics)]<- 0
+exp<- data.table::transpose(transcriptomics[,c(6:17)])
+colnames(exp)<- transcriptomics$Unique_ID
+rownames(exp)<- rownames(metabolomics)
+exp[is.na(exp)]<- 0
+
+gene_exp <- exp[,which(colnames(exp) %in% epistatic$gene)]
+
+dim(gene_exp)
+#checking indiv names are matching
+head(cbind(rownames(metabolomics), rownames(gene_exp)))
+pca.gene <- pca(gene_exp, ncomp = 10, center = TRUE, scale = TRUE)
+pca.metabolomics <- pca(metabolomics, ncomp = 10, center = TRUE, scale = TRUE)
+
+# Variable Plots ----------------------------------------------------------
+ncomp = 10
+metabolites.spls <- spls( gene_exp,metabolomics , ncomp, keepX = c(rep(50, ncomp)), keepY= c(rep(10, ncomp)), mode = "regression")
+
+plotVar(metabolites.spls, comp =1:2, 
+        var.names = list(X.label = TRUE, 
+                         Y.label = TRUE),title="Gene predict metabolites", 
+                         cex = c(4, 5))
+
+cim(metabolites.spls, comp = 1:3, xlab = "metabolites", ylab = "genes", 
+    margins = c(9, 12))
+
+
+```
+
+
+
+
+
